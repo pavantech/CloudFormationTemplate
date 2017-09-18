@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Runner for GitLab builds. Lets you have a private build agent that churns out Docker images.
+  This stack launches resources into the default VPC
+
+Parameters:
+  GitLabCIToken:
+    Type: String
+    Description: The CI Runner token for your GitLab account
+  InstanceType:
+    Type: String
+    Description: The EC2 instance type for the ECS host
+    Default: t2.micro
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: The SSH key to use for the runner instance
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC ID  
+  SSHOrigin:
+    Type: String
+    Description: The CIDR IP from which to permit SSH traffic
+    MinLength: '9'
+    MaxLength: '18'
+    Default: 0.0.0.0/0
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.    
+  NexusAuths:
+    Type: String
+    Description: Please Provide the nexus authentication Token
+  RunnerTagList:
+    Type: String
+    Description: Comma-separated tags to apply to the runner
+    Default: docker_builder,ubuntu
+  Subnet:
+    Type:  List<AWS::EC2::Subnet::Id>
+    Description: The Subnet ID 
+
+Resources:
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permit SSH from the SSHorigin
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHOrigin
+
+  RunnerInstanceLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: ami-bb9a6bc2
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref SSHKeyName
+      SecurityGroups:
+        - !Ref RunnerSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum -y update 
+          yum -y install  wget
+          wget https://download.docker.com/linux/centos/docker-ce.repo -O /etc/yum.repos.d/docker-ce.repo
+          rpm -ivf  http://mirror.centos.org/centos/7/extras/x86_64/Packages/container-selinux-2.21-1.el7.noarch.rpm
+          yum -y install docker-ce
+          usermod -aG docker $USER
+          service docker start
+          cat >> /etc/docker/daemon.json << EOF
+          {
+            "insecure-registry" : [ "nexus.betgenius.net:5000" ]
+          }
+          EOF
+          cat >> /etc/docker/config.json << EOF 
+          { 
+           "auths": {
+               "docker.betgenius.net": {
+                       "auth": "${NexusAuths}",
+                       "email": ""
+                },
+               "nexus.betgenius.net:5000": {
+                     "auth":  "${NexusAuths}",
+                     "email": "no-reply@betgenius.net"
+             }
+            }
+          } 
+          EOF
+          service docker start
+          docker pull gitlab-runner:latest
+          docker run -d \
+            --restart always \
+            --name gitlab-runner \
+            -v /root/.gitlab:/etc/gitlab-runner:Z \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            gitlab/gitlab-runner
+          sleep 5
+          docker exec gitlab-runner \
+            gitlab-ci-multi-runner register \
+            -n \
+            -url http://ec2-52-207-132-59.compute-1.amazonaws.com/  \
+            --registration-token ${GitLabCIToken} \
+            --executor docker \
+            --description "AWS-betstream-longjob runner" \
+            --docker-image alpine:latest \
+            --docker-volumes /var/run/docker.sock:/var/run/docker.sock \
+            --tag-list ${RunnerTagList}
+
+  RunnerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchConfigurationName: !Ref RunnerInstanceLaunchConfiguration
+      VPCZoneIdentifier: !Ref Subnet
+      AvailabilityZones: [ "eu-west-1a","eu-west-1b","eu-west-1c" ]
+      MaxSize: 1
+      MinSize: 0
+      DesiredCapacity: 1
+      Tags:
+        - Key: Name
+          Value: GitLabRunner
+          PropagateAtLaunch: true
